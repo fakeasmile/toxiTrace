@@ -92,6 +92,11 @@ def parse_args():
     p.add_argument("--max_num_batched_tokens", type=int, default=16384)
     p.add_argument("--gpu_memory_utilization", type=float, default=0.85)
     p.add_argument("--dry_run", action="store_true")
+    p.add_argument(
+        "--no_guided_json",
+        action="store_true",
+        help="禁用 guided_json，只用 prompt 约束（vLLM 版本不支持时使用）",
+    )
     p.add_argument("--overwrite", action="store_true")
     return p.parse_args()
 
@@ -145,10 +150,42 @@ def build_prompt(text: str) -> str:
         "- 目标不明确时选 none。\n\n"
         "【原文】\n"
         f"{text}\n\n"
-        "只输出一行 JSON，不要解释：\n"
-        '{"stance":"use|mention|oppose|none",'
-        '"target":"LGBTQ|region|gender|race|other|none"}'
+        "【输出格式】\n"
+        "只输出一个 JSON 对象，stance 和 target 各取一个值。\n"
+        '示例：{"stance":"use","target":"gender"}\n'
+        '示例：{"stance":"mention","target":"none"}\n'
+        "不要输出 \"use|mention|oppose|none\" 这样的候选列表，也不要解释。\n"
+        "stance 必须是 use、mention、oppose、none 之一；\n"
+        "target 必须是 LGBTQ、region、gender、race、other、none 之一。"
     )
+
+
+def build_sampling_params(use_guided: bool = True):
+    """优先使用 guided_json，保证输出是合法枚举；不支持则回退到 prompt 约束。"""
+    from vllm import SamplingParams
+
+    if not use_guided:
+        return SamplingParams(max_tokens=32, temperature=0), False
+    schema = {
+        "type": "object",
+        "properties": {
+            "stance": {"enum": sorted(STANCES)},
+            "target": {"enum": sorted(TARGETS)},
+        },
+        "required": ["stance", "target"],
+        "additionalProperties": False,
+    }
+    try:
+        params = SamplingParams(
+            max_tokens=32, temperature=0, guided_json=schema
+        )
+        return params, True
+    except Exception as exc:
+        print(
+            f"[warn] guided_json 不可用（{type(exc).__name__}），回退到 prompt 约束",
+            flush=True,
+        )
+        return SamplingParams(max_tokens=32, temperature=0), False
 
 
 def parse_output(text: str):
@@ -230,7 +267,6 @@ def main():
         raise FileNotFoundError(f"模型目录不存在：{args.model_path}")
 
     import run_items_v8 as v8
-    from vllm import SamplingParams
 
     tokenizer, llm = v8.load_vllm_model(
         args.model_path,
@@ -243,7 +279,8 @@ def main():
     rendered = v8.render_prompts(
         tokenizer, prompts, chat_kwargs, args.model_path.name.lower()
     )
-    sampling = SamplingParams(max_tokens=48, temperature=0)
+    sampling, guided = build_sampling_params(not args.no_guided_json)
+    print(f"[info] guided_json={guided}", flush=True)
     outputs = llm.generate(rendered, sampling, use_tqdm=True)
     if len(outputs) != len(sampled):
         raise RuntimeError(f"vLLM 输出数 {len(outputs)} != {len(sampled)}")
@@ -278,6 +315,7 @@ def main():
         "target_dist": valid_df["target"].value_counts().to_dict(),
         "by_split": result.groupby("split")["valid"].agg(["size", "sum"]).to_dict(),
         "prompt_version": PROMPT_VERSION,
+        "guided_json": bool(guided),
         "seed": args.seed,
         "n_train": args.n_train,
         "n_val": args.n_val,
