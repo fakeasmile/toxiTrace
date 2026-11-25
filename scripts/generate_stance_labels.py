@@ -61,7 +61,7 @@ DEFAULT_OUT = (
 
 STANCES = {"use", "mention", "oppose", "none"}
 TARGETS = {"LGBTQ", "region", "gender", "race", "other", "none"}
-PROMPT_VERSION = "stance-target-v1.0.0"
+PROMPT_VERSION = "stance-target-v2.0.0"
 
 
 def parse_args():
@@ -140,11 +140,29 @@ def build_prompt(text: str) -> str:
     return (
         "你是中文毒性内容标注助手。只判断“发言者立场”和“攻击目标”，"
         "不要判断整条文本是否有毒。\n\n"
-        "【立场 stance】\n"
-        "- use：发言者自己在使用攻击、辱骂或歧视性表达；\n"
-        "- mention：发言者在引用、转述或报道他人的攻击/歧视表达；\n"
-        "- oppose：发言者在反对、谴责或反驳攻击/歧视表达；\n"
-        "- none：文本没有攻击/歧视内容。\n\n"
+        "【判定顺序】\n"
+        "第 1 步：文本中是否存在针对个人/群体的攻击、辱骂、歧视、贬低、"
+        "威胁或刻板印象？\n"
+        "- 如果不存在：stance=none，target=none，直接结束。\n"
+        "- 如果存在：进入第 2 步。\n\n"
+        "第 2 步：判断发言者立场。\n"
+        "- use：发言者本人在表达攻击/歧视；\n"
+        "- mention：发言者在引用、转述或报道他人的攻击/歧视，"
+        "不表明自己赞同；\n"
+        "- oppose：发言者在反对、谴责或反驳攻击/歧视。\n\n"
+        "【重要】\n"
+        "- 不要因为文本出现身份词就判 use；只有发言者本人在攻击时才 use。\n"
+        "- 普通评论、玩梗、玩笑、没有明确攻击的文本，stance=none。\n"
+        "- 引用/转述他人攻击但自己反对的，优先 oppose；只是转述的，mention。\n\n"
+        "【示例】\n"
+        "文本：好图，我偷了\n"
+        '输出：{"stance":"none","target":"none"}\n'
+        "文本：有人说“某群体就是毒瘤”，这种说法是错的\n"
+        '输出：{"stance":"oppose","target":"none"}\n'
+        "文本：他在帖子里写道“某群体就是毒瘤”\n"
+        '输出：{"stance":"mention","target":"none"}\n'
+        "文本：某群体就是毒瘤\n"
+        '输出：{"stance":"use","target":"none"}\n\n'
         "【目标 target】\n"
         "- LGBTQ、region、gender、race、other、none；\n"
         "- 目标不明确时选 none。\n\n"
@@ -304,6 +322,13 @@ def main():
     result.to_csv(args.out, index=False, encoding="utf-8-sig")
 
     valid_df = result[result["valid"] == 1]
+    # 每个 stance 抽 10 条，便于人工检查语义是否合理
+    audit = (
+        valid_df.groupby("stance", group_keys=False)
+        .head(10)[["id", "split", "stance", "target", "toxic_true"]]
+        .merge(sampled[["id", "content"]], on="id", how="left")
+    )
+    audit.to_csv(out_dir / "audit_sample.csv", index=False, encoding="utf-8-sig")
     meta = {
         "version": PROMPT_VERSION,
         "time": time.strftime("%Y-%m-%dT%H:%M:%S"),
